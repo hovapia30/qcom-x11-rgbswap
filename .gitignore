@@ -1,0 +1,28 @@
+# Track only what belongs in the repository:
+#   * sources      — src/*.c, test/*.c
+#   * build        — Makefile
+#   * docs/license — README.md, LICENSE
+#   * this file
+# Everything else (build artifacts, editor junk, ...) is ignored.
+
+# Ignore everything ...
+/*
+# ... then re-include the items we want.
+!/.gitignore
+!/LICENSE
+!/Makefile
+!/README.md
+!/src/
+!/test/
+
+# Inside src/ and test/ keep only C sources.
+/src/*
+!/src/*.c
+/test/*
+!/test/*.c
+
+# Explicit build artifacts (belt and braces).
+*.o
+*.so
+*.a
+egl_rbtest
