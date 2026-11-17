@@ -8,6 +8,17 @@ subdriver** (`libeglSubDriverX11.so.1`) under an X server that exposes a
 It is a small, self-contained C library: no patching of the proprietary driver,
 no loss of zero-copy DMA-BUF or DRI3/GBM, and no forced software fallback.
 
+## Required setup
+
+Both of these are required for the proprietary Adreno X11 EGL stack:
+
+* this shim, and
+* the DRI3-patched Termux:X11 build —
+  [`hovapia30/termux-x11`](https://github.com/hovapia30/termux-x11),
+  branch `ed43f97-dri3`.
+
+Vulkan additionally requires `DISABLE_UBWC_VK=1`.
+
 ---
 
 ## Symptom
@@ -106,6 +117,7 @@ esac
 |------------------------------|---------|-----------------------------------------------------|
 | `QCOM_X11_RGBSWAP`           | on      | `0` disables the shim entirely.                     |
 | `QCOM_X11_RGBSWAP_VERBOSE`   | off     | `1` logs every pixel-format rewrite to stderr.      |
+| `DISABLE_UBWC_VK`            | —       | Required for the Adreno Vulkan driver.              |
 
 Typical stderr output when active:
 
