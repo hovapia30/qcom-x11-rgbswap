@@ -10,31 +10,27 @@ PREFIX  ?= /usr/local
 LIBDIR  ?= $(PREFIX)/lib
 BINDIR  ?= $(PREFIX)/bin
 
-LIB_RGBSWAP  := libqcom_x11_rgbswap.so
-LIB_TFP      := libqcom_x11_tfp.so
-TEST         := egl_rbtest
+LIB         := libqcom_x11_tfp.so
+TEST        := egl_rbtest
+SRCS        := src/qcom_x11_tfp_trace.c src/qcom_x11_tfp_fix.c src/qcom_x11_rgbswap.c
 
-all: $(LIB_RGBSWAP) $(LIB_TFP) $(TEST)
+all: $(LIB) $(TEST)
 
-$(LIB_RGBSWAP): src/qcom_x11_rgbswap.c
-	$(CC) $(CFLAGS) -shared -o $@ $< -ldl
-
-$(LIB_TFP): src/qcom_x11_tfp_trace.c src/qcom_x11_tfp_fix.c
-	$(CC) $(CFLAGS) -shared -o $@ src/qcom_x11_tfp_trace.c src/qcom_x11_tfp_fix.c -ldl -lX11 -lGL
+$(LIB): $(SRCS)
+	$(CC) $(CFLAGS) -shared -o $@ $(SRCS) -ldl -lX11 -lGL
 
 $(TEST): test/egl_rbtest.c
 	$(CC) $(CFLAGS) -o $@ $< -lX11 -lEGL -lGLESv2
 
-install: $(LIB_RGBSWAP) $(LIB_TFP)
+install: $(LIB)
 	install -d $(DESTDIR)$(LIBDIR)
-	install -m 0644 $(LIB_RGBSWAP) $(DESTDIR)$(LIBDIR)/$(LIB_RGBSWAP)
-	install -m 0644 $(LIB_TFP) $(DESTDIR)$(LIBDIR)/$(LIB_TFP)
+	install -m 0644 $(LIB) $(DESTDIR)$(LIBDIR)/$(LIB)
 
 install-test: $(TEST)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(TEST) $(DESTDIR)$(BINDIR)/$(TEST)
 
 clean:
-	rm -f $(LIB_RGBSWAP) $(LIB_TFP) $(TEST)
+	rm -f $(LIB) libqcom_x11_rgbswap.so $(TEST)
 
 .PHONY: all install install-test clean
