@@ -26,3 +26,6 @@
 *.so
 *.a
 egl_rbtest
+
+# tfp (trace/fix) build artifact
+libqcom_x11_tfp.so

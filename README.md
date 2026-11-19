@@ -167,10 +167,58 @@ magick /tmp/shot.png -format '%[pixel:p{100,200}] %[pixel:p{300,200}]\n' info:
 ├── Makefile
 ├── LICENSE
 ├── README.md
-├── src/qcom_x11_rgbswap.c     # the LD_PRELOAD shim
+├── src/qcom_x11_rgbswap.c     # R/B-swap LD_PRELOAD shim
+├── src/qcom_x11_tfp_trace.c   # TFP diagnostics/tracing task (interposition entry point)
+├── src/qcom_x11_tfp_fix.c     # TFP attribute-override/fix task
 └── test/egl_rbtest.c          # deterministic R/B channel-order test
 ```
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+---
+
+## Diagnostic/experimental: `libqcom_x11_tfp.so`
+
+Two separate C sources solve different tasks but are compiled and linked into
+a single `LD_PRELOAD` shim:
+
+- `src/qcom_x11_tfp_trace.c` — **diagnostics/tracing task**: logs GLX
+  texture-from-pixmap calls (`glXCreatePixmap`, `glXDestroyPixmap`,
+  `glXBindTexImageEXT`, `glXReleaseTexImageEXT`, `glXChooseFBConfig`,
+  `glXChooseVisual`) with optional bound-texture readback, and provides the
+  interposed GLX/dlsym entry points.
+- `src/qcom_x11_tfp_fix.c` — **attribute-override/fix task**: rewrites TFP
+  attributes (format/target) in `glXCreatePixmap` and `glXBindTexImageEXT` to
+  work around redirected/composited window contents not appearing as expected.
+
+Both are linked into one shared object (`libqcom_x11_tfp.so`), independent from
+the R/B-swap shim.
+
+### Build
+
+```sh
+make libqcom_x11_tfp.so
+# or: make
+```
+
+### Usage
+
+```sh
+# trace TFP calls
+LD_PRELOAD=/path/to/libqcom_x11_tfp.so QCOM_TFP_TRACE_LOG=/tmp/tfp.log kwin_x11 --replace
+
+# force TFP attributes (optionally log rewrites)
+LD_PRELOAD=/path/to/libqcom_x11_tfp.so QCOM_TFP_FORCE_FORMAT=rgba QCOM_TFP_LOG=/tmp/tfp-fix.log kwin_x11 --replace
+```
+
+* `QCOM_TFP_TRACE_LOG` — trace log file path (default: `stderr`).
+* `QCOM_TFP_TRACE=0` — disable tracing (enabled by default when loaded).
+* `QCOM_TFP_TRACE_READBACK=1` — sample a few bound textures via FBO readback.
+* `QCOM_TFP_TRACE_SYNC=1` — `glFinish` + short delay before readback.
+* `QCOM_TFP_FORCE_FORMAT` — `rgb` or `rgba` (overrides `GLX_TEXTURE_FORMAT_EXT`).
+* `QCOM_TFP_FORCE_TARGET` — `2d` or `rect` (overrides `GLX_TEXTURE_TARGET_EXT`).
+* `QCOM_TFP_LOG` — log file path for rewrite messages, or `1` for `stderr`
+  (default: off). Logs only when an attribute is actually rewritten.
