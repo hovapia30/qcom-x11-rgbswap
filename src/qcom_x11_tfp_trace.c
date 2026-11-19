@@ -30,10 +30,13 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <X11/Xlib.h>
 #include <GL/gl.h>
 #include <GL/glx.h>
 #include <GL/glxext.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 
 /* Implemented in qcom_x11_tfp_fix.c (fix task). */
 extern const int *tfp_fix_rewrite_attribs(const int *in, int *out, int outcap, const char *where);
@@ -52,6 +55,7 @@ static XVisualInfo *(*real_glXChooseVisual)(Display *, int, int *);
 static PFNGLXGETVISUALFROMFBCONFIGPROC real_glXGetVisualFromFBConfig;
 static GLenum (*real_glGetError)(void);
 static void (*real_glFinish)(void);
+static void (*real_glFlush)(void);
 static void (*real_glGetIntegerv)(GLenum, GLint *);
 static void (*real_glGetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
 static void (*real_glGenFramebuffers)(GLsizei, GLuint *);
@@ -63,6 +67,14 @@ static void (*real_glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum,
 static void *(*real_dlsym)(void *, const char *);
 static __GLXextFuncPtr (*real_glXGetProcAddress)(const GLubyte *);
 static __GLXextFuncPtr (*real_glXGetProcAddressARB)(const GLubyte *);
+static void (*(*real_eglGetProcAddress)(const char *))(void);
+static const char *(*real_eglQueryString)(EGLDisplay, EGLint);
+static EGLSync (*real_eglCreateSync)(EGLDisplay, EGLenum, const EGLAttrib *);
+static EGLBoolean (*real_eglDestroySync)(EGLDisplay, EGLSync);
+static EGLint (*real_eglClientWaitSync)(EGLDisplay, EGLSync, EGLint, EGLTime);
+static EGLBoolean (*real_eglGetSyncAttrib)(EGLDisplay, EGLSync, EGLint, EGLAttrib *);
+static EGLBoolean (*real_eglWaitSync)(EGLDisplay, EGLSync, EGLint);
+
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -194,8 +206,16 @@ static void resolve_all(void)
     R(glXGetVisualFromFBConfig);
     R(glXGetProcAddress);
     R(glXGetProcAddressARB);
+    R(eglGetProcAddress);
+    R(eglQueryString);
+    R(eglCreateSync);
+    R(eglDestroySync);
+    R(eglClientWaitSync);
+    R(eglGetSyncAttrib);
+    R(eglWaitSync);
     R(glGetError);
     R(glFinish);
+    R(glFlush);
     R(glGetIntegerv);
     R(glGetTexLevelParameteriv);
     R(glGenFramebuffers);
@@ -348,6 +368,230 @@ XVisualInfo *glXChooseVisual(Display *dpy, int screen, int *attribList)
     return r;
 }
 
+
+
+
+/* --- EGL_KHR_fence_sync mapping (EGL 1.5 native sync if available, fallback) --- */
+
+#ifndef EGL_SYNC_FENCE_KHR
+#define EGL_SYNC_FENCE_KHR 0x30F9
+#endif
+#ifndef EGL_SYNC_TYPE_KHR
+#define EGL_SYNC_TYPE_KHR 0x30F7
+#endif
+#ifndef EGL_SYNC_STATUS_KHR
+#define EGL_SYNC_STATUS_KHR 0x30F1
+#endif
+#ifndef EGL_SYNC_CONDITION_KHR
+#define EGL_SYNC_CONDITION_KHR 0x30F8
+#endif
+#ifndef EGL_SIGNALED_KHR
+#define EGL_SIGNALED_KHR 0x30F2
+#endif
+#ifndef EGL_UNSIGNALED_KHR
+#define EGL_UNSIGNALED_KHR 0x30F3
+#endif
+#ifndef EGL_SYNC_PRIOR_COMMANDS_COMPLETE_KHR
+#define EGL_SYNC_PRIOR_COMMANDS_COMPLETE_KHR 0x30F0
+#endif
+#ifndef EGL_SYNC_FLUSH_COMMANDS_BIT_KHR
+#define EGL_SYNC_FLUSH_COMMANDS_BIT_KHR 0x0001
+#endif
+#ifndef EGL_CONDITION_SATISFIED_KHR
+#define EGL_CONDITION_SATISFIED_KHR 0x30F6
+#endif
+#ifndef EGL_TIMEOUT_EXPIRED_KHR
+#define EGL_TIMEOUT_EXPIRED_KHR 0x30F5
+#endif
+#ifndef EGL_FOREVER_KHR
+#define EGL_FOREVER_KHR 0xFFFFFFFFFFFFFFFFull
+#endif
+
+static pthread_mutex_t ext_mu = PTHREAD_MUTEX_INITIALIZER;
+static char extbuf[8192];
+static int extbuf_real; /* 1 if extbuf was built from a real driver query */
+static __thread int in_egl_query_string;
+
+static EGLSyncKHR fake_fence_sync(void)
+{
+    return (EGLSyncKHR)(uintptr_t)0x1;
+}
+
+static int is_fake_fence_sync(EGLSyncKHR sync)
+{
+    return sync == fake_fence_sync();
+}
+
+/* Not exported as a symbol override: libEGL may call eglQueryString internally
+ * during its own initialization, and overriding the exported symbol can deadlock
+ * on libEGL's pthread_once. External callers resolving via eglGetProcAddress/dlsym
+ * still receive this wrapper so EGL_KHR_fence_sync can be advertised. */
+static const char *shim_eglQueryString(EGLDisplay dpy, EGLint name)
+{
+    (void)dpy;
+    ensure_init();
+    resolve_all();
+
+    /* Never call real eglQueryString: libEGL may invoke this hook (via
+     * eglGetProcAddress/dlsym resolution during its own pthread_once init) and
+     * libEGL's eglQueryString can self-deadlock on the same once control.
+     * Return safe defaults for common queries. */
+    switch (name) {
+    case EGL_EXTENSIONS:
+        pthread_mutex_lock(&ext_mu);
+        if (extbuf[0] == '\0') {
+            snprintf(extbuf, sizeof(extbuf),
+                     "EGL_KHR_fence_sync EGL_KHR_image EGL_KHR_image_base "
+                     "EGL_KHR_image_pixmap EGL_KHR_gl_texture_2D_image "
+                     "EGL_KHR_gl_texture_cubemap_image EGL_KHR_gl_renderbuffer_image "
+                     "EGL_KHR_surfaceless_context EGL_KHR_create_context "
+                     "EGL_EXT_platform_base EGL_EXT_platform_x11 EGL_KHR_platform_x11 "
+                     "EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers");
+        }
+        {
+            const char *r = extbuf;
+            pthread_mutex_unlock(&ext_mu);
+            return r;
+        }
+    case EGL_VERSION:
+        return "1.5 Adreno (shim)";
+    case EGL_VENDOR:
+        return "Qualcomm";
+    case EGL_CLIENT_APIS:
+        return "OpenGL_ES OpenGL";
+    default:
+        return "";
+    }
+}
+
+EGLSyncKHR eglCreateSyncKHR(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list)
+{
+    ensure_init();
+    resolve_all();
+
+    if (real_eglCreateSync) {
+        /* EGL 1.5 takes EGLAttrib attributes; convert from EGLint list. */
+        EGLAttrib attrs[16];
+        const EGLAttrib *ap = NULL;
+        if (attrib_list) {
+            int i = 0, j = 0;
+            while (attrib_list[i] != EGL_NONE && j < 14) {
+                attrs[j++] = (EGLAttrib)attrib_list[i++];
+                attrs[j++] = (EGLAttrib)attrib_list[i++];
+            }
+            attrs[j] = (EGLAttrib)EGL_NONE;
+            ap = attrs;
+        }
+        EGLSync sync = real_eglCreateSync(dpy, type, ap);
+        if (sync != EGL_NO_SYNC) {
+            return (EGLSyncKHR)sync;
+        }
+    }
+
+    /* Fallback: fake fence sync with GL flush/finish semantics. */
+    if (real_glFlush) real_glFlush();
+    return fake_fence_sync();
+}
+
+EGLBoolean eglDestroySyncKHR(EGLDisplay dpy, EGLSyncKHR sync)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync(sync)) {
+        return EGL_TRUE;
+    }
+    if (real_eglDestroySync) {
+        return real_eglDestroySync(dpy, (EGLSync)sync);
+    }
+    return EGL_FALSE;
+}
+
+EGLint eglClientWaitSyncKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout)
+{
+    ensure_init();
+    resolve_all();
+    (void)flags;
+    if (is_fake_fence_sync(sync)) {
+        if (timeout > 0 && real_glFinish) {
+            real_glFinish();
+        } else if (real_glFlush) {
+            real_glFlush();
+        }
+        return EGL_CONDITION_SATISFIED_KHR;
+    }
+    if (real_eglClientWaitSync) {
+        return real_eglClientWaitSync(dpy, (EGLSync)sync, flags, (EGLTime)timeout);
+    }
+    if (timeout > 0 && real_glFinish) real_glFinish();
+    return EGL_CONDITION_SATISFIED_KHR;
+}
+
+EGLBoolean eglGetSyncAttribKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint attribute, EGLint *value)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync(sync)) {
+        if (!value) return EGL_FALSE;
+        switch (attribute) {
+        case EGL_SYNC_TYPE_KHR:
+            *value = EGL_SYNC_FENCE_KHR;
+            return EGL_TRUE;
+        case EGL_SYNC_STATUS_KHR:
+            *value = EGL_SIGNALED_KHR;
+            return EGL_TRUE;
+        case EGL_SYNC_CONDITION_KHR:
+            *value = EGL_SYNC_PRIOR_COMMANDS_COMPLETE_KHR;
+            return EGL_TRUE;
+        default:
+            *value = 0;
+            return EGL_TRUE;
+        }
+    }
+    if (real_eglGetSyncAttrib) {
+        EGLAttrib v = 0;
+        EGLBoolean r = real_eglGetSyncAttrib(dpy, (EGLSync)sync, attribute, &v);
+        if (value) *value = (EGLint)v;
+        return r;
+    }
+    return EGL_FALSE;
+}
+
+EGLBoolean eglWaitSyncKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync(sync)) {
+        if (real_glFlush) real_glFlush();
+        return EGL_TRUE;
+    }
+    if (real_eglWaitSync) {
+        return real_eglWaitSync(dpy, (EGLSync)sync, flags);
+    }
+    if (real_glFlush) real_glFlush();
+    return EGL_TRUE;
+}
+
+void (*eglGetProcAddress(const char *procname))(void)
+{
+    ensure_init();
+    resolve_all();
+    if (procname) {
+        if (strcmp(procname, "eglQueryString") == 0) return (void (*)(void))shim_eglQueryString;
+        if (strcmp(procname, "eglCreateSyncKHR") == 0) return (void (*)(void))eglCreateSyncKHR;
+        if (strcmp(procname, "eglDestroySyncKHR") == 0) return (void (*)(void))eglDestroySyncKHR;
+        if (strcmp(procname, "eglClientWaitSyncKHR") == 0) return (void (*)(void))eglClientWaitSyncKHR;
+        if (strcmp(procname, "eglGetSyncAttribKHR") == 0) return (void (*)(void))eglGetSyncAttribKHR;
+        if (strcmp(procname, "eglWaitSyncKHR") == 0) return (void (*)(void))eglWaitSyncKHR;
+    }
+    if (real_eglGetProcAddress)
+        return real_eglGetProcAddress(procname);
+    /* Fallback: try to resolve via real dlsym from libEGL if needed. */
+    resolve_real_dlsym();
+    if (real_dlsym)
+        return (void (*)(void))real_dlsym(RTLD_NEXT, "eglGetProcAddress");
+    return NULL;
+}
+
 void *dlsym(void *handle, const char *symbol)
 {
     ensure_init();
@@ -368,10 +612,17 @@ void *dlsym(void *handle, const char *symbol)
     RET_IF(glXReleaseTexImageEXT);
     RET_IF(glXChooseFBConfig);
     RET_IF(glXChooseVisual);
+    RET_IF(eglGetProcAddress);
+    RET_IF(eglCreateSyncKHR);
+    RET_IF(eglDestroySyncKHR);
+    RET_IF(eglClientWaitSyncKHR);
+    RET_IF(eglGetSyncAttribKHR);
+    RET_IF(eglWaitSyncKHR);
     RET_IF(dlsym);
     RET_IF(glXGetProcAddress);
     RET_IF(glXGetProcAddressARB);
 #undef RET_IF
+    if (strcmp(symbol, "eglQueryString") == 0) return (void *)shim_eglQueryString;
 
     return result;
 }
