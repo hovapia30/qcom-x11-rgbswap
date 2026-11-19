@@ -409,8 +409,6 @@ XVisualInfo *glXChooseVisual(Display *dpy, int screen, int *attribList)
 
 static pthread_mutex_t ext_mu = PTHREAD_MUTEX_INITIALIZER;
 static char extbuf[8192];
-static int extbuf_real; /* 1 if extbuf was built from a real driver query */
-static __thread int in_egl_query_string;
 
 static EGLSyncKHR fake_fence_sync(void)
 {
@@ -695,9 +693,6 @@ void *dlsym(void *handle, const char *symbol)
 
     void *real = real_dlsym ? real_dlsym(handle, symbol) : NULL;
     void *result = rgbswap_wrap_dlsym_result(handle, symbol, real);
-
-    if (!symbol)
-        return result;
 
     resolve_all();
 

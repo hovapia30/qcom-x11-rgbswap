@@ -100,10 +100,11 @@ static void *wrap_subdriver(void *obj) {
     *vt_slot = new_vt;
 
     if (!wrap_logged) {
-        fprintf(stderr,
-                "[rgbswap] hooked subdriver obj=%p vtable %p -> %p, CreateConfig %p -> %p\n",
-                obj, (void *)orig_vt, (void *)new_vt, real_cfg, (void *)wrap_CreateConfig);
         wrap_logged = 1;
+        if (verbose())
+            fprintf(stderr,
+                    "[rgbswap] hooked subdriver obj=%p vtable %p -> %p, CreateConfig %p -> %p\n",
+                    obj, (void *)orig_vt, (void *)new_vt, real_cfg, (void *)wrap_CreateConfig);
     }
     return obj;
 }
@@ -141,3 +142,14 @@ void *rgbswap_wrap_dlsym_result(void *handle, const char *symbol, void *result) 
 void *CreateSubDriver(void) {
     return do_CreateSubDriver();
 }
+
+#ifdef QCOM_RGBSWAP_STANDALONE
+/* Standalone build needs its own dlsym interposition; the combined shim
+ * calls rgbswap_wrap_dlsym_result() from its unified dlsym hook instead. */
+void *dlsym(void *handle, const char *symbol)
+{
+    dlsym_fn fn = get_real_dlsym();
+    void *real = fn ? fn(handle, symbol) : NULL;
+    return rgbswap_wrap_dlsym_result(handle, symbol, real);
+}
+#endif
