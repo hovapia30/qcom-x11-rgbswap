@@ -1,33 +1,22 @@
 /*
- * libqcom_x11_rgbswap.so — LD_PRELOAD fix for swapped R/B channels with the
- * proprietary Qualcomm Adreno EGL/X11 subdriver (libeglSubDriverX11.so.1).
+ * qcom_x11_rgbswap.c - R/B channel swap fix (task)
  *
- * The bug (confirmed empirically with a gdb experiment):
- *   During eglChooseConfig(), libGLESv2_adreno.so.2 creates EGL configs through
- *   libeglSubDriverX11.so.1::CreateSubDriver()->vtable[5] = CreateConfig(),
- *   passing a Qualcomm EGL pixel format. For X visual 0x44
- *   (depth = 32, red_mask = 0xff0000, i.e. BGRX in memory) the driver picks
- *     - 0x1fb (XBGR8888, RGBA in memory, no alpha)  -> should be 0x58 (XRGB8888)
- *     - 0x1c  (ABGR8888, RGBA in memory, with alpha) -> should be 0x57 (ARGB8888)
- *   As a result the renderer writes RGBA while X reads BGRX, so the red and blue
- *   channels end up swapped. Vulkan (libvulkan_adreno.so.1) is fine: its WSI
- *   adapts to the X visual masks on its own.
+ * LD_PRELOAD fix for swapped R/B channels with the proprietary Qualcomm Adreno
+ * EGL/X11 subdriver (libeglSubDriverX11.so.1).
  *
- * How we hook it:
- *   libGLESv2 does not obtain CreateSubDriver from the global symbol table; it
- *   uses dlopen("libeglSubDriverX11.so.1") + dlsym(). So we intercept dlsym()
- *   and, when "CreateSubDriver" is requested, return our own wrapper. The
- *   wrapper calls the real CreateSubDriver, copies the subdriver object's vtable
- *   and replaces entry [5] (CreateConfig) with a wrapper that rewrites the pixel
- *   format BEFORE the config is created. This changes both the render swizzle
- *   and the DRM fourcc of the back buffer (via iQctPixelFormat), so zero-copy
- *   DMA-BUF and DRI3/GBM are preserved (no DISABLE_DRI3 hack needed).
+ * libeglSubDriverX11 picks RGBA-in-memory pixel formats for BGRX X visuals, so
+ * the renderer writes RGBA while X reads BGRX and red/blue channels are swapped.
+ * This hooks subdriver CreateConfig (via CreateSubDriver) and rewrites the
+ * pixel format before the config is created, preserving zero-copy DMA-BUF/DRI3.
+ *
+ * This file implements the R/B-swap task and is linked together with
+ * qcom_x11_tfp_trace.c and qcom_x11_tfp_fix.c into a single libqcom_x11_tfp.so.
+ * The trace module provides the unified interposed dlsym/glXGetProcAddress entry
+ * points and consults this module for CreateSubDriver interception.
  *
  * Controls:
- *   QCOM_X11_RGBSWAP=0          — disable entirely (enabled by default).
- *   QCOM_X11_RGBSWAP_VERBOSE=1  — log every pixel format rewrite.
- *
- * Build:  cc -shared -fPIC -O2 -o libqcom_x11_rgbswap.so qcom_x11_rgbswap.c -ldl
+ *   QCOM_X11_RGBSWAP=0          - disable entirely (enabled by default).
+ *   QCOM_X11_RGBSWAP_VERBOSE=1  - log every pixel format rewrite.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -123,7 +112,11 @@ static void *do_CreateSubDriver(void) {
     if (!real_CreateSubDriver) {
         void *h = dlopen("libeglSubDriverX11.so.1", RTLD_NOW | RTLD_NOLOAD);
         if (!h) h = dlopen("libeglSubDriverX11.so.1", RTLD_NOW);
-        if (h) real_CreateSubDriver = (CreateSubDriver_t)get_real_dlsym()(h, "CreateSubDriver");
+        if (h) {
+            dlsym_fn fn = get_real_dlsym();
+            if (fn)
+                real_CreateSubDriver = (CreateSubDriver_t)fn(h, "CreateSubDriver");
+        }
         if (!real_CreateSubDriver) {
             fprintf(stderr, "[rgbswap] CreateSubDriver: real symbol not found\n");
             return NULL;
@@ -132,17 +125,16 @@ static void *do_CreateSubDriver(void) {
     return wrap_subdriver(real_CreateSubDriver());
 }
 
-/* dlsym interception: we only substitute "CreateSubDriver". */
-void *dlsym(void *handle, const char *symbol) {
-    dlsym_fn fn = get_real_dlsym();
-    void *r = fn ? fn(handle, symbol) : NULL;
-    if (r && strcmp(symbol, "CreateSubDriver") == 0) {
-        real_CreateSubDriver = (CreateSubDriver_t)r;
+/* Called by the unified dlsym hook with the real dlsym result. */
+void *rgbswap_wrap_dlsym_result(void *handle, const char *symbol, void *result) {
+    (void)handle;
+    if (result && symbol && strcmp(symbol, "CreateSubDriver") == 0) {
+        real_CreateSubDriver = (CreateSubDriver_t)result;
         if (verbose())
             fprintf(stderr, "[rgbswap] dlsym(\"CreateSubDriver\") -> wrapper\n");
         return (void *)do_CreateSubDriver;
     }
-    return r;
+    return result;
 }
 
 /* In case the symbol is resolved through the global table instead. */

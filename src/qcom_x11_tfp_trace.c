@@ -6,17 +6,20 @@
  *  glXChooseFBConfig, glXChooseVisual) to help diagnose why redirected window
  * contents may not appear when compositing.
  *
- * This file provides the interposed GLX/dlsym entry points for the combined
- * libqcom_x11_tfp.so and is linked together with qcom_x11_tfp_fix.c (attribute
- * override/fix task). TFP attributes are passed through the fix module before
- * being forwarded to the real driver.
+ * This file provides the unified interposed GLX/dlsym/glXGetProcAddress entry
+ * points for the combined libqcom_x11_tfp.so and is linked together with:
+ *   - qcom_x11_tfp_fix.c     (TFP attribute override/fix task)
+ *   - qcom_x11_rgbswap.c     (Adreno EGL/X11 R/B channel swap task)
+ * TFP attributes are passed through the fix module before being forwarded to the
+ * real driver. dlsym results are passed through the R/B-swap module so that
+ * CreateSubDriver interception remains active.
  *
  * Output: stderr by default, or the file named by $QCOM_TFP_TRACE_LOG.
  * Enable/disable: set QCOM_TFP_TRACE=0 to disable (default: enabled when loaded).
  *
  * Build (as part of combined .so):
  *   cc -shared -fPIC -O2 -Wall -Wextra -o libqcom_x11_tfp.so \
- *      src/qcom_x11_tfp_trace.c src/qcom_x11_tfp_fix.c -ldl -lX11 -lGL
+ *      src/qcom_x11_tfp_trace.c src/qcom_x11_tfp_fix.c src/qcom_x11_rgbswap.c -ldl -lX11 -lGL
  */
 
 #define _GNU_SOURCE
@@ -34,6 +37,9 @@
 
 /* Implemented in qcom_x11_tfp_fix.c (fix task). */
 extern const int *tfp_fix_rewrite_attribs(const int *in, int *out, int outcap, const char *where);
+
+/* Implemented in qcom_x11_rgbswap.c (R/B swap task). */
+extern void *rgbswap_wrap_dlsym_result(void *handle, const char *symbol, void *result);
 
 /* Real function pointers */
 static PFNGLXCREATEPIXMAPPROC       real_glXCreatePixmap;
@@ -346,7 +352,13 @@ void *dlsym(void *handle, const char *symbol)
 {
     ensure_init();
     resolve_real_dlsym();
-    if (!symbol) return real_dlsym ? real_dlsym(handle, symbol) : NULL;
+
+    void *real = real_dlsym ? real_dlsym(handle, symbol) : NULL;
+    void *result = rgbswap_wrap_dlsym_result(handle, symbol, real);
+
+    if (!symbol)
+        return result;
+
     resolve_all();
 
 #define RET_IF(name) if (strcmp(symbol, #name) == 0) return (void *)name
@@ -361,7 +373,7 @@ void *dlsym(void *handle, const char *symbol)
     RET_IF(glXGetProcAddressARB);
 #undef RET_IF
 
-    return real_dlsym ? real_dlsym(handle, symbol) : NULL;
+    return result;
 }
 
 __GLXextFuncPtr glXGetProcAddress(const GLubyte *procName)
