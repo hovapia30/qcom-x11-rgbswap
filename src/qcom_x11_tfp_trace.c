@@ -422,6 +422,11 @@ static int is_fake_fence_sync(EGLSyncKHR sync)
     return sync == fake_fence_sync();
 }
 
+static int is_fake_fence_sync_core(EGLSync sync)
+{
+    return (uintptr_t)sync == (uintptr_t)0x1;
+}
+
 /* Not exported as a symbol override: libEGL may call eglQueryString internally
  * during its own initialization, and overriding the exported symbol can deadlock
  * on libEGL's pthread_once. External callers resolving via eglGetProcAddress/dlsym
@@ -571,12 +576,103 @@ EGLBoolean eglWaitSyncKHR(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags)
     return EGL_TRUE;
 }
 
+/* Core EGL 1.5 sync wrappers for compatibility with modules resolving non-KHR symbols. */
+EGLSync eglCreateSync(EGLDisplay dpy, EGLenum type, const EGLAttrib *attrib_list)
+{
+    ensure_init();
+    resolve_all();
+    if (real_eglCreateSync) {
+        EGLSync sync = real_eglCreateSync(dpy, type, attrib_list);
+        if (sync != EGL_NO_SYNC)
+            return sync;
+    }
+    if (type == EGL_SYNC_FENCE_KHR || type == 0x30F9 /* EGL_SYNC_FENCE */) {
+        if (real_glFlush) real_glFlush();
+        return (EGLSync)(uintptr_t)0x1;
+    }
+    return EGL_NO_SYNC;
+}
+
+EGLBoolean eglDestroySync(EGLDisplay dpy, EGLSync sync)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync_core(sync))
+        return EGL_TRUE;
+    if (real_eglDestroySync)
+        return real_eglDestroySync(dpy, sync);
+    return EGL_FALSE;
+}
+
+EGLint eglClientWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTime timeout)
+{
+    ensure_init();
+    resolve_all();
+    (void)flags;
+    if (is_fake_fence_sync_core(sync)) {
+        if (timeout > 0 && real_glFinish)
+            real_glFinish();
+        else if (real_glFlush)
+            real_glFlush();
+        return EGL_CONDITION_SATISFIED_KHR;
+    }
+    if (real_eglClientWaitSync)
+        return real_eglClientWaitSync(dpy, sync, flags, timeout);
+    if (timeout > 0 && real_glFinish) real_glFinish();
+    return EGL_CONDITION_SATISFIED_KHR;
+}
+
+EGLBoolean eglGetSyncAttrib(EGLDisplay dpy, EGLSync sync, EGLint attribute, EGLAttrib *value)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync_core(sync)) {
+        if (!value) return EGL_FALSE;
+        switch (attribute) {
+        case EGL_SYNC_TYPE_KHR:
+            *value = (EGLAttrib)EGL_SYNC_FENCE_KHR;
+            return EGL_TRUE;
+        case EGL_SYNC_STATUS_KHR:
+            *value = (EGLAttrib)EGL_SIGNALED_KHR;
+            return EGL_TRUE;
+        case EGL_SYNC_CONDITION_KHR:
+            *value = (EGLAttrib)EGL_SYNC_PRIOR_COMMANDS_COMPLETE_KHR;
+            return EGL_TRUE;
+        default:
+            *value = 0;
+            return EGL_TRUE;
+        }
+    }
+    if (real_eglGetSyncAttrib)
+        return real_eglGetSyncAttrib(dpy, sync, attribute, value);
+    return EGL_FALSE;
+}
+
+EGLBoolean eglWaitSync(EGLDisplay dpy, EGLSync sync, EGLint flags)
+{
+    ensure_init();
+    resolve_all();
+    if (is_fake_fence_sync_core(sync)) {
+        if (real_glFlush) real_glFlush();
+        return EGL_TRUE;
+    }
+    if (real_eglWaitSync)
+        return real_eglWaitSync(dpy, sync, flags);
+    if (real_glFlush) real_glFlush();
+    return EGL_TRUE;
+}
+
 void (*eglGetProcAddress(const char *procname))(void)
 {
     ensure_init();
     resolve_all();
     if (procname) {
         if (strcmp(procname, "eglQueryString") == 0) return (void (*)(void))shim_eglQueryString;
+        if (strcmp(procname, "eglCreateSync") == 0) return (void (*)(void))eglCreateSync;
+        if (strcmp(procname, "eglDestroySync") == 0) return (void (*)(void))eglDestroySync;
+        if (strcmp(procname, "eglClientWaitSync") == 0) return (void (*)(void))eglClientWaitSync;
+        if (strcmp(procname, "eglGetSyncAttrib") == 0) return (void (*)(void))eglGetSyncAttrib;
+        if (strcmp(procname, "eglWaitSync") == 0) return (void (*)(void))eglWaitSync;
         if (strcmp(procname, "eglCreateSyncKHR") == 0) return (void (*)(void))eglCreateSyncKHR;
         if (strcmp(procname, "eglDestroySyncKHR") == 0) return (void (*)(void))eglDestroySyncKHR;
         if (strcmp(procname, "eglClientWaitSyncKHR") == 0) return (void (*)(void))eglClientWaitSyncKHR;
@@ -613,6 +709,11 @@ void *dlsym(void *handle, const char *symbol)
     RET_IF(glXChooseFBConfig);
     RET_IF(glXChooseVisual);
     RET_IF(eglGetProcAddress);
+    RET_IF(eglCreateSync);
+    RET_IF(eglDestroySync);
+    RET_IF(eglClientWaitSync);
+    RET_IF(eglGetSyncAttrib);
+    RET_IF(eglWaitSync);
     RET_IF(eglCreateSyncKHR);
     RET_IF(eglDestroySyncKHR);
     RET_IF(eglClientWaitSyncKHR);
